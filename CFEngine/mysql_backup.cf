@@ -102,6 +102,8 @@ bundle agent mysql_backup_do_one_step(cluster,myrole) {
     "mysql_dir" string => "/data/mysql";
     # Where to store our backup
     "backup_dir" string => "/var/backup/mysql-$(cluster)";
+    # Port to use for backup
+    "backup_port" string => "55555";
     
     "ccluster" string => canonify("$(cluster)");
     "cserver_for[$(role)]" string => canonify("$(exostate.$(ccluster)_$(role))");
@@ -177,16 +179,17 @@ bundle agent mysql_backup_do_one_step(cluster,myrole) {
         mkdir $(backup_dir)/$BACKUP
         rm -f $(backup_dir)/db-fifo
         mkfifo $(backup_dir)/db-fifo
-        nc -l 55555 > $(backup_dir)/db-fifo &' \
+        nc -l $(backup_port) > $(backup_dir)/db-fifo &' \
         </dev/null >/dev/null 2>&1"
         classes => signal("started_backup"),
         contain => in_shell;
     slave.shut_down.backup_started_backup::
       # Do the same on the slave
+      # Using bash sockets here due to weirdness involving netcat and fifos
       "/bin/sh -c \
         'rm -f /tmp/backup-fifo
         mkfifo /tmp/backup-fifo
-        </tmp/backup-fifo cat > /dev/tcp/$(exostate.$(ccluster)_backup)/55555 &' \
+        </tmp/backup-fifo cat > /dev/tcp/$(exostate.$(ccluster)_backup)/$(backup_port) &' \
         </dev/null >/dev/null 2>&1"
         classes => signal("started_backup"),
         contain => in_shell;
