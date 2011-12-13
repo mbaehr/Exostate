@@ -1,0 +1,363 @@
+#
+# MySQL backup orchestration by Mike Baehr @ PLoS
+#
+# You have permission to use, redistribute, and modify
+# this file without conditions.
+
+# This is a 3-host orchestration to back up a MySQL master-pair
+#
+# Host 1: current master
+# Host 2: current slave
+# Host 3: backup server
+#
+# All of these are part of a named "cluster". The name is arbitrary.
+#
+# The bundle which does role discovery is not shown.
+# An agent will need to figure out whether it is the master,
+# slave, or backup server.
+#
+# If you're using Flipper, this can be done by checking whether
+# the read or write IP is currently bound to the machine.
+# That is, in fact, how I am doing it.
+# More here: http://provenscaling.com/software/flipper/
+#
+# This is the first production use (to the best of my knowledge)
+# of Exostate.  It's a bit rough around the edges, in that a bunch
+# of the work I'm doing in the first agent bundle could be
+# outsourced to a better-written Exostate module (the current one
+# is quite bare).  As a proof of concept, however, I hope this is
+# instructive as to the potential utility of Exostate.
+
+# First, announcement and discovery...
+#
+# I'm rather anal here about demanding fresh information...
+# If there isn't enough information available to effect
+# the next state transition, Exostate will ask for it
+# (which returns immediately).
+#
+# We bail, and hope that the info is available by the next
+# agent run.  We're making promises based on this state,
+# so we err on the side of doing nothing.
+
+bundle agent mysql_backup_paired(cluster,myrole) {
+  vars:
+    "ccluster" string => canonify("$(cluster)");
+  classes:
+    !announced_role::
+      # First, announce that I'm holding my role
+      "announced_role" expression =>
+        usemodule("exostate",
+          "-s $(cluster):$(myrole):$(sys.host)"
+        ),
+        action => immediate;
+    announced_role.!gathered_roles::
+      # Second, figure out who's in what role by asking for announcements
+      "gathered_roles" expression =>
+        usemodule("exostate",
+          "-g $(cluster):slave%1200 \
+           -g $(cluster):master%1200 \
+           -g $(cluster):backup%1200"
+        ),
+        action => immediate;
+    gathered_roles.!gathered_states::
+      # Third, bail if any of the 3 has not announced itself in the last 10 minutes
+      "dont_run_a_step" not =>
+        classify(and(
+          isvariable("exostate.$(ccluster)_master"),
+          isvariable("exostate.$(ccluster)_slave"),
+          isvariable("exostate.$(ccluster)_backup")
+        )),
+        action => immediate;
+      "gathered_states" expression =>
+        usemodule("exostate",
+          "-g $(exostate.$(ccluster)_master):$(cluster)_backup_state%1200 \
+           -g $(exostate.$(ccluster)_slave):$(cluster)_backup_state%1200 \
+           -g $(exostate.$(ccluster)_backup):$(cluster)_backup_state%1200"
+        ),
+        action => immediate;
+  methods:
+    gathered_states.!dont_run_a_step::
+      # Now that we know who's what, where, perform a backup step
+      "$(myrole)" usebundle =>
+        mysql_backup_do_one_step("$(cluster)","$(myrole)"),
+        action => immediate;
+}
+
+# Next, state transitions...
+#
+# It's best to fully-qualify the conditions for each promise
+# with as many combinations of your state plus other hosts' state
+# as possible.  This prevents, for example, repeating the same
+# action, just because another host's state hasn't changed.
+
+bundle agent mysql_backup_do_one_step(cluster,myrole) {
+  vars:
+    "role" slist => { "master", "slave", "backup" };
+   
+    # Credentials for MySQL
+    # This user will need the SUPER privilege for
+    # a few of the backup steps
+    "creds" string => "-uexample -pexample";
+    # MySQL data dir
+    "mysql_dir" string => "/data/mysql";
+    # Where to store our backup
+    "backup_dir" string => "/var/backup/mysql-$(cluster)";
+    
+    "ccluster" string => canonify("$(cluster)");
+    "cserver_for[$(role)]" string => canonify("$(exostate.$(ccluster)_$(role))");
+    "master_state" slist => {
+      "ready_to_backup",
+      "stopped_slave",
+      "started_slave",
+      "done_with_backup"
+    };
+    "slave_state" slist => {
+      "ready_to_backup",
+      "stopped_slave",
+      "shutting_down",
+      "shut_down",
+      "started_backup",
+      "backup_succeeded",
+      "backup_failed",
+      "started_up",
+      "started_slave",
+      "done_with_backup",
+    };
+    "backup_state" slist => {
+      "ready_to_backup",
+      "started_backup",
+      "backup_succeeded",
+      "backup_failed",
+      "done_with_backup"
+    };
+    "state" slist => {
+      @(master_state), @(slave_state), @(backup_state)
+    };
+  classes:
+    "$(role)" expression => strcmp("$(role)","$(myrole)");
+    # Augment our context with state info, named by role instead of host...
+    "$(role)_$(state)" expression =>
+      strcmp("$(exostate.$(cserver_for[$(role)])_$(ccluster)_backup_state)",
+             "$(state)");
+    # And in shorthand for our own role...
+    "$(state)" expression =>
+      strcmp("$(exostate.$(cserver_for[$(myrole)])_$(ccluster)_backup_state)",
+             "$(state)");
+  commands:
+    # Now, state transitions listed in order (instead of breaking out by role)
+    # to give a clearer idea of what's going on...
+    slave.ready_to_backup::
+      # First, stop replication on the slave...
+      "/usr/bin/mysql $(creds) -e'slave stop;'"
+        classes => signal("stopped_slave"),
+        contain => in_shell;
+  vars:
+    # See footnote #1
+    master.ready_to_backup.slave_stopped_slave::
+      "replication_check" string => "-e'show slave status \G'| /bin/grep 'Seconds_Behind_Master' | /bin/awk '{print $2}'";
+  commands:
+    master.ready_to_backup.slave_stopped_slave::
+      # Now, stop replication on the master (after waiting for replication to settle)
+      "/usr/bin/mysql $(creds) -e'slave stop;'"
+        ifvarclass => or(strcmp(
+          execresult("/usr/bin/mysql $(creds) $(replication_check)","useshell"),
+          "0"
+        )),
+        classes => signal("stopped_slave"),
+        contain => in_shell;
+    slave.stopped_slave.master_stopped_slave::
+      # Now that replication is shut off in both directions, the slave can shut down
+      "/sbin/service mysqld stop"
+        classes => signal("shut_down"),
+        contain => in_shell_and_silent;
+    backup.ready_to_backup.slave_shut_down::
+      # Now that the slave has shut down, let's get ready to receive a backup
+      "/bin/sh -c \
+        'BACKUP=backup-`date +%m%d%y`
+        mkdir $(backup_dir)/$BACKUP
+        rm -f $(backup_dir)/db-fifo
+        mkfifo $(backup_dir)/db-fifo
+        nc -l 55555 > $(backup_dir)/db-fifo &' \
+        </dev/null >/dev/null 2>&1"
+        classes => signal("started_backup"),
+        contain => in_shell;
+    slave.shut_down.backup_started_backup::
+      # Do the same on the slave
+      "/bin/sh -c \
+        'rm -f /tmp/backup-fifo
+        mkfifo /tmp/backup-fifo
+        </tmp/backup-fifo cat > /dev/tcp/$(exostate.$(ccluster)_backup)/55555 &' \
+        </dev/null >/dev/null 2>&1"
+        classes => signal("started_backup"),
+        contain => in_shell;
+    backup.started_backup.slave_started_backup::
+      # Actually receive the backup
+      "/bin/sh -c \
+        'BACKUP=backup-`date +%m%d%y`
+        cd $(backup_dir)/$BACKUP
+        date +%s >> /tmp/i-am-sending-the-backup
+        tar -zxpf $(backup_dir)/db-fifo'"
+        classes => signal_if_else("backup_succeeded","backup_failed"),
+         action => backup_task,
+        contain => in_shell;
+    slave.started_backup.backup_started_backup::
+      # Actually send the backup
+      "/bin/sh -c \
+        'cd $(mysql_dir)
+        date +%s >> /tmp/i-am-untarring-the-backup
+        tar -czp . >/tmp/backup-fifo'"
+        classes => signal_if_else("backup_succeeded","backup_failed"),
+         action => backup_task,
+        contain => in_shell;
+    backup.backup_succeeded::
+      # Clean up, finish up
+      "/bin/rm -f $(backup_dir)/db-fifo"
+        classes => signal("done_with_backup");
+    slave.backup_succeeded::
+      # We're done, so let's start MySQL up again
+      "/sbin/service mysqld start"
+        classes => signal("started_up"),
+        contain => in_shell_and_silent;
+  vars:
+    # See footnote #1
+    slave.started_up::
+      "mysql_port" string => "3306";
+      "read_from_mysql" string => readtcp("127.0.0.1","$(mysql_port)","",5);
+  commands:
+    slave.started_up::
+      # Start replication once MySQL is listening
+      "/usr/bin/mysql $(creds) -e'slave start;'"
+        ifvarclass => or(isvariable("read_from_mysql")),
+        classes => signal("started_slave"),
+        contain => in_shell;
+    master.stopped_slave.slave_started_slave::
+      # Start replication once the slave has
+      "/usr/bin/mysql $(creds) -e'slave start;'"
+        classes => signal("started_slave"),
+        contain => in_shell;
+  vars:
+    # See footnote #1
+    slave.started_slave.master_started_slave::
+      "master_info" string => "-e'show master status \G '| /bin/grep 'File' | /bin/awk '{print $2}'";
+      "latest_binlog" string => execresult("/usr/bin/mysql $(creds) $(master_info)","useshell");
+  commands:
+    slave.started_slave.master_started_slave::
+      # We're done; purge old binlogs
+      "/usr/bin/mysql $(creds) -e'purge master logs to \"$(latest_binlog)\";'"
+        classes => signal("done_with_backup"),
+        contain => in_shell;
+  vars:
+    # See footnote #1
+    master.started_slave.slave_done_with_backup::
+      "master_info" string => "-e'show master status \G '| /bin/grep 'File' | /bin/awk '{print $2}'";
+      "latest_binlog" string => execresult("/usr/bin/mysql $(creds) $(master_info)","useshell");
+  commands:
+    master.started_slave.slave_done_with_backup::
+      # We're done; purge old binlogs
+      "/usr/bin/mysql $(creds) -e'purge master logs to \"$(latest_binlog)\";'"
+        classes => signal("done_with_backup"),
+        contain => in_shell;
+
+    any::
+      # Signal any state transition
+      "$(sys.workdir)/modules/exostate -s $(cluster)_backup_state:$(state)"
+        ifvarclass => "signal_$(state)",
+           classes => signalled("$(state)");
+}
+
+body action backup_task {
+  # Fork off; this is long-running
+  background => "true";
+  # Don't run if we've run within the last two hours
+  ifelapsed => "120";
+  # Cancel if it runs for 4 hours or more
+  expireafter => "240";
+  # Be quiet
+  no_output => "true";
+}
+
+body classes signal(state) {
+  promise_repaired => { "signal_$(state)" };
+  persist_time => "60";
+}
+
+body classes signal_if_else(yes,no) {
+  promise_kept => { "signal_$(yes)" };
+  promise_repaired => { "signal_$(yes)" };
+  repair_failed => { "signal_$(no)" };
+  repair_denied => { "signal_$(no)" };
+  repair_timeout => { "signal_$(no)" };
+  persist_time => "60";
+}
+
+body classes signalled(state) {
+  cancel_kept => { "signal_$(state)" };
+  cancel_repaired => { "signal_$(state)" };
+}
+
+# 
+# Uncomment these if you don't use the COPBL: 
+# (that's where they're from)
+#
+#body contain in_shell {
+#  useshell => "true";
+#}
+#
+#body contain in_shell_and_silent {
+#  useshell => "true";
+#  no_output => "true";
+#}
+#
+#body action immediate {
+#  ifelapsed => "0";
+#}
+
+# Now report successful (or failed) backup
+# and reset state for the next run...
+#
+# Assuming you have some parent bundle which runs the backup bundle
+# during "backup hours", it would be appropriate to call this bundle
+# when "backup hours" are complete.
+
+bundle agent mysql_backup_report(cluster) {
+  vars:
+    "ccluster" string => canonify("$(cluster)");
+  classes:
+    !gathered_state::
+      "gathered_state" expression => usemodule("exostate", "-g $(cluster)_backup_state");
+
+  reports:
+    gathered_state::
+      "Backup for $(cluster) succeeded"
+        ifvarclass => "$(ccluster)_backup_state_done_with_backup";
+      "Backup for $(cluster) failed"
+        ifvarclass => "$(ccluster)_backup_state_backup_failed";
+
+  commands:
+    "$(sys.workdir)/modules/exostate -s $(cluster)_backup_state:ready_to_backup";
+}
+
+# Footnote #1: Sometimes we only want CFEngine to evaluate a function
+# if it is actually within context.  Unfortunately, the designed behavior
+# is to always evaluate functions, whether or not their result is an
+# active promise. This is apparently a Feature.
+#
+# See: https://cfengine.com/bugtracker/view.php?id=761
+#
+# This can be very annoying, for example, if you have a function that 
+# checks to see if MySQL is running.  If it's not running, CFEngine
+# will throw some annoying error output.  We have a very good idea of
+# when we are and are not interested in that information, but CFEngine
+# does not care. It will evaluate it anyway.
+#
+# There is, thankfully, a handy way to force CFEngine to only evalute
+# a function when we want it to do.  We accomplish this by expanding
+# a variable in the arguments; a variable which must only be promised
+# in the desired context.  CFEngine will bail on evaluating the
+# function until all variables are expandable, thus giving us the
+# level of control over evaluation that we actually want.
+#
+# You will want to apply this patch first, or else you'll get strange
+# looking output when CFEngine bails on these evaluations: 
+#
+# Bug/patch: https://cfengine.com/bugtracker/view.php?id=849

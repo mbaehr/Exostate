@@ -1,0 +1,69 @@
+#!/bin/bash
+#
+# This file is part of Exostate.
+# 
+# Exostate is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# 
+# Exostate is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with Exostate.  If not, see <http://www.gnu.org/licenses/>.
+#
+
+# (basic) exostate CFEngine module
+#
+# usage:
+# 
+# exostate -s db_state:running -g mia-db01:db_state%300 -g mia-bak01:backup_state%300 -g mia-adm01:last_update
+#
+# Will set db_state:running for this host
+# And fetch db_state for mia-db01 and backup_state for mia-bak01 if <5 mins old
+# And fetch mia-adm01:last_update unconditionally
+#
+# Getters will augment a class in the calling context
+# if the scalar has been successfully found, in the format:
+# ($HOST_)?$HANDLE_$VALUE
+# They will also set the result as a variable:
+# $(HOST_)?$HANDLE
+
+declare -a TO_SET
+declare -a TO_GET
+
+. /etc/sysconfig/exostate
+
+EXOSTATE_ARGS="-d $STORE -g $GROUP -i $IF -p $PORT"
+
+while getopts "s:g:" OPTION; do
+  case $OPTION in
+    s)
+      TO_SET+=($OPTARG)
+      ;;
+    g)
+      TO_GET+=($OPTARG)
+      ;;
+  esac
+done
+
+for SET in ${TO_SET[@]}; do
+  HANDLE=${SET%:*}
+  VALUE=${SET##*:}
+  ARGS="$EXOSTATE_ARGS -h $HANDLE -v $VALUE"
+  exostate-set $ARGS
+done
+
+for GET in ${TO_GET[@]}; do 
+  HANDLE="${GET%\%*}"
+  ARGS="$EXOSTATE_ARGS -h $HANDLE"
+  [[ $GET =~ .*%.* ]] && ARGS="$ARGS -f ${GET#*%}"
+  if RES=$(exostate-get $ARGS); then
+    SET="${HANDLE}:${RES}"
+    echo +${SET//[^[:alnum:]]/_}
+    echo =${HANDLE//[^[:alnum:]]/_}=${RES}
+  fi
+done

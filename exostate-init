@@ -1,0 +1,66 @@
+#!/bin/bash
+#
+# chkconfig: - 99 02
+# description: Exostate distributed state information daemon
+
+. /etc/init.d/functions
+
+PORT=999
+STORE=/var/run/exostate/exostate.db
+LOG=/var/log/exostate.log
+GROUP=225.0.0.2
+IF=eth0
+
+[ -e /etc/sysconfig/exostate ] && . /etc/sysconfig/exostate
+
+EXOSTATE_ARGS="-d $STORE -g $GROUP -i $IF -p $PORT"
+
+start() {
+  echo -n $"Starting exostate daemon"
+  daemon "exostate-daemon $EXOSTATE_ARGS 2>&1 >>$LOG &"
+  RETVAL=$?
+  if [ "$RETVAL" -eq 0 ]
+  then
+    success
+  else
+    failure
+  fi
+  echo
+  return $RETVAL
+}	
+
+stop() {
+  echo -n $"Shutting down exostate daemon"
+  killproc exostate-daemon
+  RETVAL=$?
+  if [ "$RETVAL" -eq 0 ]
+  then
+      success
+  else
+      failure
+  fi
+  echo
+  return $RETVAL
+}
+
+restart() {
+  stop
+  start
+}	
+
+case "$1" in
+  start)
+    start
+    ;;
+  stop)
+    stop
+    ;;
+  restart)
+    restart
+    ;;
+  *)
+    echo $"Usage: $0 {start|stop|restart}"
+    exit 1
+esac
+
+exit $RETVAL

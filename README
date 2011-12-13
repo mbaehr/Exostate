@@ -1,0 +1,35 @@
+Exostate, by Mike Baehr (C) 2011 Public Library of Science
+
+System to store, broadcast, and rebroadcast announcements
+
+Announcements are identified by a handle of the form [hostname:name]
+
+Example:
+  mia-db01a:db_state
+  rwc-bak01:backup_state
+
+A daemon joins a multicast group and listens for (and stores)
+all announcements.
+
+A "want" announcement is also supported, with an optional freshness
+constraint.  This will cause anyone with a copy of the announcement
+that's suitably fresh to rebroadcast it.
+
+For example, mia-db01a is interested in the state of mia-db01b.
+
+It will announce that it "wants" mia-db01b:db_state, no older than
+3600 seconds ago.
+
+Any daemon with a suitably fresh copy of that announcement will
+rebroadcast it.  If mia-db01b is running a daemon, it will rebroadcast
+the latest version of its announcement (assuming it is holding a copy)
+unconditionally, because it is considered authoritative for that handle.
+
+This way, a host that has not been part of the multicast "cloud" can
+quickly come up to speed.
+
+This is built to be integrated into decision-making systems, with an
+emphasis on distributed, fault-tolerant orchestration.
+
+Exostate is free software, released under the GNU GPL v3;
+you can find a copy of the license in COPYING.
