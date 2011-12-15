@@ -116,7 +116,6 @@ bundle agent mysql_backup_do_one_step(cluster,myrole) {
     "slave_state" slist => {
       "ready_to_backup",
       "stopped_slave",
-      "shutting_down",
       "shut_down",
       "started_backup",
       "backup_succeeded",
@@ -198,7 +197,6 @@ bundle agent mysql_backup_do_one_step(cluster,myrole) {
       "/bin/sh -c \
         'BACKUP=backup-`date +%m%d%y`
         cd $(backup_dir)/$BACKUP
-        date +%s >> /tmp/i-am-sending-the-backup
         tar -zxpf $(backup_dir)/db-fifo'"
         classes => signal_if_else("backup_succeeded","backup_failed"),
          action => backup_task,
@@ -207,7 +205,6 @@ bundle agent mysql_backup_do_one_step(cluster,myrole) {
       # Actually send the backup
       "/bin/sh -c \
         'cd $(mysql_dir)
-        date +%s >> /tmp/i-am-untarring-the-backup
         tar -czp . >/tmp/backup-fifo'"
         classes => signal_if_else("backup_succeeded","backup_failed"),
          action => backup_task,
